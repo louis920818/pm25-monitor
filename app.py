@@ -9,6 +9,7 @@ from datetime import date, datetime
 from sklearn.ensemble import RandomForestRegressor
 import warnings
 import urllib3
+import pytz
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import os
 
@@ -271,7 +272,7 @@ def get_final_data(selected_date, selected_hour):
             date_str = selected_date.strftime('%Y-%m-%d')
             hour_str = f"{selected_hour:02d}"
 
-            with st.spinner(f"雲端無 {selected_date} 的資料，嘗試從環境部 API 自動下載..."):
+            with st.spinner(f"找不到 {selected_date} 的資料，嘗試從環境部 API 自動下載..."):
                 # aqx_p_02 = 空氣品質監測時值（支援歷史查詢）
                 # MOENV API v2 已停止支援 GTE/LTE，改用 EQ 精確比對整點時間
                 filters = f"datacreationdate,EQ,{date_str} {hour_str}:00"
@@ -299,7 +300,7 @@ def get_final_data(selected_date, selected_hour):
                         f"環境部 API 無 {date_str} {hour_str}:00 的歷史資料。\n\n"
                         "可能原因：該日期資料尚未收錄，或超出 API 保存範圍。\n\n"
                         "請至 [環境部開放資料平台](https://data.moenv.gov.tw/dataset/detail/aqx_p_02) "
-                        "手動下載 CSV 並上傳至 Google Drive。"
+                        "手動下載 CSV 並放入 pm2.5Data Set 資料夾。"
                     )
                     return None
 
@@ -315,7 +316,7 @@ def get_final_data(selected_date, selected_hour):
                     st.warning(
                         f"環境部 API 查無 {date_str} {hour_str}:00 的資料。\n\n"
                         "請至 [環境部開放資料平台](https://data.moenv.gov.tw/dataset/detail/aqx_p_02) "
-                        "手動下載 CSV 並上傳至 Google Drive。"
+                        "手動下載 CSV 並放入 pm2.5Data Set 資料夾。"
                     )
                     return None
 
@@ -354,14 +355,13 @@ def get_final_data(selected_date, selected_hour):
 # ==========================================
 # UI 介面
 # ==========================================
-today = date.today()
+tw_tz = pytz.timezone('Asia/Taipei')
+today = datetime.now(tw_tz).date()
 
 st.sidebar.header("參數設定")
 target_date = st.sidebar.date_input("選擇觀測/預測日期", value=today)
 
 if target_date == today:
-    import pytz
-    tw_tz = pytz.timezone('Asia/Taipei')
     target_hour = datetime.now(tw_tz).hour
     st.sidebar.info(f"即時模式：目前時間 {target_hour:02d}:00")
 else:
