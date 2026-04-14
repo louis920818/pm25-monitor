@@ -8,6 +8,7 @@ import numpy as np
 from datetime import date, datetime
 from sklearn.ensemble import RandomForestRegressor
 import warnings
+import io
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import os
@@ -30,10 +31,45 @@ st.title("全台 PM2.5 監測 x 預測 x 天氣因子整合系統")
 # 金鑰設定（從 .env 或環境變數讀取）
 # ==========================================
 CSV_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pm2.5Data Set')
-MOENV_API_KEY   = st.secrets.get('MOENV_API_KEY', '') or os.environ.get('MOENV_API_KEY', '')
-CWA_API_KEY     = st.secrets.get('CWA_API_KEY', '') or os.environ.get('CWA_API_KEY', '')
+MOENV_API_KEY      = st.secrets.get('MOENV_API_KEY', '') or os.environ.get('MOENV_API_KEY', '')
+CWA_API_KEY        = st.secrets.get('CWA_API_KEY', '') or os.environ.get('CWA_API_KEY', '')
 TELEGRAM_BOT_TOKEN = st.secrets.get('TELEGRAM_BOT_TOKEN', '') or os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID   = st.secrets.get('TELEGRAM_CHAT_ID', '') or os.environ.get('TELEGRAM_CHAT_ID', '')
+GAS_URL            = st.secrets.get('GAS_URL', '') or os.environ.get('GAS_URL', '')
+
+# ==========================================
+# Google Drive（Apps Script）輔助函式
+# ==========================================
+def gdrive_save(filename, csv_content):
+    """將 CSV 字串上傳到 Google Drive"""
+    if not GAS_URL:
+        return
+    try:
+        requests.post(GAS_URL, json={'filename': filename, 'content': csv_content}, timeout=15, verify=False)
+    except Exception:
+        pass
+
+def gdrive_load(filename):
+    """從 Google Drive 讀取 CSV 字串，找不到回傳 None"""
+    if not GAS_URL:
+        return None
+    try:
+        resp = requests.get(GAS_URL, params={'filename': filename}, timeout=15, verify=False)
+        if resp.text.strip() == 'NOT_FOUND':
+            return None
+        return resp.text
+    except Exception:
+        return None
+
+def gdrive_list():
+    """取得 Google Drive 上所有 CSV 檔名"""
+    if not GAS_URL:
+        return []
+    try:
+        resp = requests.get(GAS_URL, timeout=15, verify=False)
+        return resp.json()
+    except Exception:
+        return []
 
 COUNTY_COORDS = {
     '基隆市': [25.1276, 121.7391], '台北市': [25.0329, 121.5654], '新北市': [25.0115, 121.4615],
@@ -116,21 +152,34 @@ def get_cwa_weather():
 # ==========================================
 @st.cache_data
 def load_csv():
-    """自動讀取資料夾內所有 CSV 並合併"""
+    """自動讀取本機資料夾 + Google Drive 所有 CSV 並合併"""
+    dfs = []
+
+    # 本機 CSV
     csv_files = [
         os.path.join(CSV_FOLDER, f)
         for f in os.listdir(CSV_FOLDER)
         if f.lower().endswith('.csv')
     ]
-    if not csv_files:
-        raise FileNotFoundError(f"在 {CSV_FOLDER} 找不到任何 CSV 檔案")
-
-    dfs = []
     for path in csv_files:
         try:
             dfs.append(pd.read_csv(path))
         except Exception:
             continue
+
+    # Google Drive CSV（補充本機沒有的檔案）
+    local_names = {os.path.basename(p) for p in csv_files}
+    for fname in gdrive_list():
+        if fname.endswith('.csv') and fname not in local_names:
+            content = gdrive_load(fname)
+            if content:
+                try:
+                    dfs.append(pd.read_csv(io.StringIO(content)))
+                except Exception:
+                    continue
+
+    if not dfs:
+        raise FileNotFoundError("本機與 Google Drive 均找不到任何 CSV 檔案")
 
     df = pd.concat(dfs, ignore_index=True)
 
@@ -330,6 +379,10 @@ def get_final_data(selected_date, selected_hour):
                     existing = pd.read_csv(save_path)
                     new_df = pd.concat([existing, new_df], ignore_index=True).drop_duplicates()
                 new_df.to_csv(save_path, index=False)
+
+                # 同步儲存到 Google Drive
+                gdrive_save(f"PM2.5_{date_str}.csv", new_df.to_csv(index=False))
+
                 load_csv.clear()
                 st.sidebar.success(f"已自動下載並儲存 {date_str} {hour_str}:00 的資料！")
 
