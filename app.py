@@ -8,6 +8,8 @@ import numpy as np
 from datetime import date, datetime
 from sklearn.ensemble import RandomForestRegressor
 import warnings
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import os
 
 try:
@@ -79,7 +81,7 @@ def get_cwa_weather():
             f"https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0003-001"
             f"?Authorization={CWA_API_KEY}&elementName=WDSD,HUMD"
         )
-        resp = requests.get(url, timeout=10).json()
+        resp = requests.get(url, timeout=10, verify=False).json()
         stations = resp.get('records', {}).get('Station', [])
 
         county_data = {}
@@ -223,7 +225,7 @@ def get_final_data(selected_date, selected_hour):
             return None
         try:
             url = f"https://data.moenv.gov.tw/api/v2/aqx_p_432?api_key={MOENV_API_KEY}"
-            resp = requests.get(url, timeout=10).json()
+            resp = requests.get(url, timeout=10, verify=False).json()
             records = resp['records'] if isinstance(resp, dict) and 'records' in resp else resp
             df = pd.DataFrame(records)
             pm_col = 'pm2.5' if 'pm2.5' in df.columns else 'pm25'
@@ -280,7 +282,7 @@ def get_final_data(selected_date, selected_hour):
                     f"&limit=1000"
                 )
                 try:
-                    resp = requests.get(url, timeout=20)
+                    resp = requests.get(url, timeout=20, verify=False)
                 except requests.exceptions.Timeout:
                     st.error("API 請求逾時，請稍後再試。")
                     return None
@@ -479,7 +481,8 @@ if data is not None:
                     requests.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                         json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-                        timeout=10
+                        timeout=10,
+                        verify=False
                     )
                     st.sidebar.success(f"告警已發送！共 {len(high_risk)} 個縣市超標。")
                 except Exception as e:
