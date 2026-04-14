@@ -360,7 +360,9 @@ st.sidebar.header("參數設定")
 target_date = st.sidebar.date_input("選擇觀測/預測日期", value=today)
 
 if target_date == today:
-    target_hour = datetime.now().hour
+    import pytz
+    tw_tz = pytz.timezone('Asia/Taipei')
+    target_hour = datetime.now(tw_tz).hour
     st.sidebar.info(f"即時模式：目前時間 {target_hour:02d}:00")
 else:
     target_hour = st.sidebar.slider("選擇時間（0～23 點）", min_value=0, max_value=23, value=12, step=1)
