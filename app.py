@@ -148,38 +148,25 @@ def get_cwa_weather():
         return {}
 
 # ==========================================
-# CSV 讀取（自動合併資料夾內所有 CSV）
+# CSV 讀取（只從 Google Drive 抓）
 # ==========================================
 @st.cache_data
 def load_csv():
-    """自動讀取本機資料夾 + Google Drive 所有 CSV 並合併"""
+    """從 Google Drive 讀取所有 CSV 並合併"""
     dfs = []
 
-    # 本機 CSV
-    csv_files = [
-        os.path.join(CSV_FOLDER, f)
-        for f in os.listdir(CSV_FOLDER)
-        if f.lower().endswith('.csv')
-    ]
-    for path in csv_files:
-        try:
-            dfs.append(pd.read_csv(path))
-        except Exception:
-            continue
-
-    # Google Drive CSV（補充本機沒有的檔案）
-    local_names = {os.path.basename(p) for p in csv_files}
     for fname in gdrive_list():
-        if fname.endswith('.csv') and fname not in local_names:
-            content = gdrive_load(fname)
-            if content:
-                try:
-                    dfs.append(pd.read_csv(io.StringIO(content)))
-                except Exception:
-                    continue
+        if not fname.endswith('.csv'):
+            continue
+        content = gdrive_load(fname)
+        if content:
+            try:
+                dfs.append(pd.read_csv(io.StringIO(content)))
+            except Exception:
+                continue
 
     if not dfs:
-        raise FileNotFoundError("本機與 Google Drive 均找不到任何 CSV 檔案")
+        raise FileNotFoundError("Google Drive 上找不到任何 CSV 檔案")
 
     df = pd.concat(dfs, ignore_index=True)
 
@@ -320,7 +307,7 @@ def get_final_data(selected_date, selected_hour):
             date_str = selected_date.strftime('%Y-%m-%d')
             hour_str = f"{selected_hour:02d}"
 
-            with st.spinner(f"本機無 {selected_date} 的資料，嘗試從環境部 API 自動下載..."):
+            with st.spinner(f"雲端無 {selected_date} 的資料，嘗試從環境部 API 自動下載..."):
                 # aqx_p_02 = 空氣品質監測時值（支援歷史查詢）
                 # MOENV API v2 已停止支援 GTE/LTE，改用 EQ 精確比對整點時間
                 filters = f"datacreationdate,EQ,{date_str} {hour_str}:00"
@@ -348,7 +335,7 @@ def get_final_data(selected_date, selected_hour):
                         f"環境部 API 無 {date_str} {hour_str}:00 的歷史資料。\n\n"
                         "可能原因：該日期資料尚未收錄，或超出 API 保存範圍。\n\n"
                         "請至 [環境部開放資料平台](https://data.moenv.gov.tw/dataset/detail/aqx_p_02) "
-                        "手動下載 CSV 並放入資料夾。"
+                        "手動下載 CSV 並上傳至 Google Drive。"
                     )
                     return None
 
@@ -364,7 +351,7 @@ def get_final_data(selected_date, selected_hour):
                     st.warning(
                         f"環境部 API 查無 {date_str} {hour_str}:00 的資料。\n\n"
                         "請至 [環境部開放資料平台](https://data.moenv.gov.tw/dataset/detail/aqx_p_02) "
-                        "手動下載 CSV 並放入資料夾。"
+                        "手動下載 CSV 並上傳至 Google Drive。"
                     )
                     return None
 
@@ -373,15 +360,13 @@ def get_final_data(selected_date, selected_hour):
                     st.warning("API 回傳空資料集。")
                     return None
 
-                # 儲存到本機供下次使用
-                save_path = os.path.join(CSV_FOLDER, f"PM2.5_{date_str}.csv")
-                if os.path.exists(save_path):
-                    existing = pd.read_csv(save_path)
-                    new_df = pd.concat([existing, new_df], ignore_index=True).drop_duplicates()
-                new_df.to_csv(save_path, index=False)
-
-                # 同步儲存到 Google Drive
-                gdrive_save(f"PM2.5_{date_str}.csv", new_df.to_csv(index=False))
+                # 儲存到 Google Drive
+                filename = f"PM2.5_{date_str}.csv"
+                existing_content = gdrive_load(filename)
+                if existing_content:
+                    existing_df = pd.read_csv(io.StringIO(existing_content))
+                    new_df = pd.concat([existing_df, new_df], ignore_index=True).drop_duplicates()
+                gdrive_save(filename, new_df.to_csv(index=False))
 
                 load_csv.clear()
                 st.sidebar.success(f"已自動下載並儲存 {date_str} {hour_str}:00 的資料！")
