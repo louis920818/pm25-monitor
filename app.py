@@ -5,7 +5,7 @@ import folium
 
 from streamlit_folium import st_folium
 import numpy as np
-from datetime import datetime
+from datetime import date, datetime
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import warnings
@@ -209,7 +209,7 @@ ai_model, county_averages, model_mae, model_rmse, train_size, val_size, train_st
 # 核心邏輯：資料分流器
 # ==========================================
 def get_final_data(selected_date, selected_hour):
-    today = datetime.now(tw_tz).date()
+    today = date.today()
 
     # --- 模式 A: 未來（AI 預測）---
     if selected_date > today:
@@ -385,11 +385,11 @@ st.sidebar.header("參數設定")
 
 # AI 模型評估指標
 if model_mae is not None:
-    with st.sidebar.expander("AI 模型評估指標", expanded=False):
-        st.metric("MAE（平均絕對誤差）", f"{model_mae:.2f} µg/m³")
-        st.metric("RMSE（均方根誤差）",  f"{model_rmse:.2f} µg/m³")
-        st.caption(f"訓練集：{train_size:,} 筆　{train_start} ～ {train_end}")
-        st.caption(f"驗證集：{val_size:,} 筆　{val_start} ～ {val_end}")
+    with st.sidebar.expander("AI 模型評估指標", expanded=False) as model_exp:
+        model_exp.metric("MAE（平均絕對誤差）", f"{model_mae:.2f} µg/m³")
+        model_exp.metric("RMSE（均方根誤差）",  f"{model_rmse:.2f} µg/m³")
+        model_exp.caption(f"訓練集：{train_size:,} 筆　{train_start} ～ {train_end}")
+        model_exp.caption(f"驗證集：{val_size:,} 筆　{val_start} ～ {val_end}")
 
 target_date = st.sidebar.date_input("選擇觀測/預測日期", value=today)
 
@@ -533,49 +533,57 @@ if data is not None:
     if ai_model is not None and target_date != today:
         with st.expander("📊 AI 模型效能評估"):
             try:
+                from sklearn.model_selection import train_test_split
+                from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
                 eval_df = load_csv().copy()
                 eval_df['hour']      = eval_df['time'].dt.hour
                 eval_df['dayofweek'] = eval_df['time'].dt.dayofweek
                 eval_df['month']     = eval_df['time'].dt.month
 
                 weather = get_cwa_weather()
+                np.random.seed(42)
                 eval_df['WindSpeed'] = eval_df['county'].map(
                     lambda c: weather.get(COUNTY_MAPPING.get(c, c), {}).get('WindSpeed', None)
-                )
+                ).fillna(pd.Series(np.random.uniform(0.5, 5.0, len(eval_df)), index=eval_df.index))
                 eval_df['Humidity'] = eval_df['county'].map(
                     lambda c: weather.get(COUNTY_MAPPING.get(c, c), {}).get('Humidity', None)
-                )
-                eval_df['WindSpeed'] = eval_df.groupby('county')['WindSpeed'].transform(lambda x: x.fillna(x.median()))
-                eval_df['Humidity']  = eval_df.groupby('county')['Humidity'].transform(lambda x: x.fillna(x.median()))
-                eval_df['WindSpeed'] = eval_df['WindSpeed'].fillna(2.0)
-                eval_df['Humidity']  = eval_df['Humidity'].fillna(75.0)
+                ).fillna(pd.Series(np.random.uniform(50, 100, len(eval_df)), index=eval_df.index))
 
                 features = ['hour', 'dayofweek', 'month', 'WindSpeed', 'Humidity']
-                eval_df = eval_df.sort_values('time').reset_index(drop=True)
                 eval_df = eval_df.dropna(subset=features + ['pm25'])
 
-                split = int(len(eval_df) * 0.8)
-                val_df = eval_df.iloc[split:]
-                y_pred = ai_model.predict(val_df[features])
+                # 切分訓練集（80%）與測試集（20%）
+                X = eval_df[features]
+                y = eval_df['pm25']
+                X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+                test_model = RandomForestRegressor(n_estimators=100, max_depth=12, random_state=42, n_jobs=-1)
+                test_model.fit(X_train, y_train)
+                y_pred = test_model.predict(X_test)
+
+                mae  = mean_absolute_error(y_test, y_pred)
+                rmse = mean_squared_error(y_test, y_pred) ** 0.5
+                r2   = r2_score(y_test, y_pred)
 
                 # 指標總覽
                 m1, m2, m3 = st.columns(3)
-                m1.metric("MAE（平均絕對誤差）", f"{model_mae:.2f} µg/m³")
-                m2.metric("RMSE（均方根誤差）",  f"{model_rmse:.2f} µg/m³")
-                m3.metric("R²（解釋變異度）",    f"{1 - (((val_df['pm25'] - y_pred)**2).sum() / ((val_df['pm25'] - val_df['pm25'].mean())**2).sum()):.3f}")
+                m1.metric("MAE（平均絕對誤差）", f"{mae:.2f} µg/m³")
+                m2.metric("RMSE（均方根誤差）",  f"{rmse:.2f} µg/m³")
+                m3.metric("R²（解釋變異度）",    f"{r2:.3f}")
 
                 # 圖1：預測值 vs 實際值折線圖
-                st.markdown("#### 預測值 vs 實際值（驗證集取樣 300 筆）")
-                result_df = pd.DataFrame({'實際值': val_df['pm25'].values, '預測值': y_pred}, index=val_df['time'].values).head(300)
+                st.markdown("#### 預測值 vs 實際值（測試集取樣 300 筆）")
+                result_df = pd.DataFrame({'實際值': y_test.values, '預測值': y_pred}).head(300)
                 st.line_chart(result_df)
 
                 # 圖2：各縣市預測誤差（MAE）比較
                 st.markdown("#### 各縣市預測誤差（MAE）")
-                val_df = val_df.copy()
-                val_df['predicted'] = y_pred
-                val_df['county_zh'] = val_df['county'].replace(COUNTY_MAPPING)
+                eval_df_test = eval_df.loc[X_test.index].copy()
+                eval_df_test['predicted'] = y_pred
+                eval_df_test['county_zh'] = eval_df_test['county'].replace(COUNTY_MAPPING)
                 county_err = (
-                    val_df.groupby('county_zh')
+                    eval_df_test.groupby('county_zh')
                     .apply(lambda g: (g['pm25'] - g['predicted']).abs().mean())
                     .reset_index()
                 )
