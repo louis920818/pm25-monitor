@@ -579,14 +579,11 @@ if data is not None:
 
                 # 圖2：各縣市預測誤差（MAE）比較
                 st.markdown("#### 各縣市預測誤差（MAE）")
-                eval_df_test = eval_df.loc[X_test.index].copy()
+                eval_df_test = eval_df.loc[X_test.index].copy().reset_index(drop=True)
                 eval_df_test['predicted'] = y_pred
                 eval_df_test['county_zh'] = eval_df_test['county'].replace(COUNTY_MAPPING)
-                county_err = (
-                    eval_df_test.groupby('county_zh')
-                    .apply(lambda g: (g['pm25'] - g['predicted']).abs().mean())
-                    .reset_index()
-                )
+                eval_df_test['error'] = (eval_df_test['pm25'] - eval_df_test['predicted']).abs()
+                county_err = eval_df_test.groupby('county_zh')['error'].mean().reset_index()
                 county_err.columns = ['縣市', 'MAE']
                 county_err = county_err.sort_values('MAE', ascending=False)
                 st.bar_chart(county_err.set_index('縣市'))
