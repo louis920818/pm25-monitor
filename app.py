@@ -533,59 +533,86 @@ if data is not None:
     if ai_model is not None and target_date != today:
         with st.expander("📊 AI 模型效能評估"):
             try:
-                from sklearn.model_selection import train_test_split
+                import xgboost as xgb
                 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
                 eval_df = load_csv().copy()
-                eval_df['hour']      = eval_df['time'].dt.hour
-                eval_df['dayofweek'] = eval_df['time'].dt.dayofweek
-                eval_df['month']     = eval_df['time'].dt.month
+                eval_df = eval_df.sort_values('time').reset_index(drop=True)
+                eval_df['hour']       = eval_df['time'].dt.hour
+                eval_df['dayofweek']  = eval_df['time'].dt.dayofweek
+                eval_df['month']      = eval_df['time'].dt.month
+                eval_df['hour_sin']   = np.sin(2 * np.pi * eval_df['hour'] / 24)
+                eval_df['hour_cos']   = np.cos(2 * np.pi * eval_df['hour'] / 24)
+                eval_df['is_weekend'] = (eval_df['dayofweek'] >= 5).astype(int)
 
                 weather = get_cwa_weather()
-                np.random.seed(42)
                 eval_df['WindSpeed'] = eval_df['county'].map(
                     lambda c: weather.get(COUNTY_MAPPING.get(c, c), {}).get('WindSpeed', None)
-                ).fillna(pd.Series(np.random.uniform(0.5, 5.0, len(eval_df)), index=eval_df.index))
+                )
                 eval_df['Humidity'] = eval_df['county'].map(
                     lambda c: weather.get(COUNTY_MAPPING.get(c, c), {}).get('Humidity', None)
-                ).fillna(pd.Series(np.random.uniform(50, 100, len(eval_df)), index=eval_df.index))
+                )
+                eval_df['WindSpeed'] = eval_df.groupby('county')['WindSpeed'].transform(lambda x: x.fillna(x.median())).fillna(2.0)
+                eval_df['Humidity']  = eval_df.groupby('county')['Humidity'].transform(lambda x: x.fillna(x.median())).fillna(75.0)
 
-                features = ['hour', 'dayofweek', 'month', 'WindSpeed', 'Humidity']
-                eval_df = eval_df.dropna(subset=features + ['pm25'])
+                rf_features  = ['hour', 'dayofweek', 'month', 'WindSpeed', 'Humidity']
+                xgb_features = ['hour_sin', 'hour_cos', 'dayofweek', 'is_weekend', 'month', 'WindSpeed', 'Humidity']
 
-                # 切分訓練集（80%）與測試集（20%）
-                X = eval_df[features]
-                y = eval_df['pm25']
-                X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+                eval_df = eval_df.dropna(subset=rf_features + ['pm25'])
 
-                test_model = RandomForestRegressor(n_estimators=100, max_depth=12, random_state=42, n_jobs=-1)
-                test_model.fit(X_train, y_train)
-                y_pred = test_model.predict(X_test)
+                # 按時間 80/20 切分
+                split = int(len(eval_df) * 0.8)
+                train_df = eval_df.iloc[:split]
+                test_df  = eval_df.iloc[split:].reset_index(drop=True)
 
-                mae  = mean_absolute_error(y_test, y_pred)
-                rmse = mean_squared_error(y_test, y_pred) ** 0.5
-                r2   = r2_score(y_test, y_pred)
+                # RandomForest
+                rf_model = RandomForestRegressor(n_estimators=100, max_depth=12, random_state=42, n_jobs=-1)
+                rf_model.fit(train_df[rf_features], train_df['pm25'])
+                rf_pred = rf_model.predict(test_df[rf_features])
 
-                # 指標總覽
-                m1, m2, m3 = st.columns(3)
-                m1.metric("MAE（平均絕對誤差）", f"{mae:.2f} µg/m³")
-                m2.metric("RMSE（均方根誤差）",  f"{rmse:.2f} µg/m³")
-                m3.metric("R²（解釋變異度）",    f"{r2:.3f}")
+                # XGBoost
+                xgb_model = xgb.XGBRegressor(
+                    n_estimators=300, learning_rate=0.05, max_depth=6,
+                    subsample=0.8, colsample_bytree=0.8,
+                    tree_method='hist', random_state=42, verbosity=0
+                )
+                xgb_model.fit(train_df[xgb_features], train_df['pm25'])
+                xgb_pred = xgb_model.predict(test_df[xgb_features])
 
-                # 圖1：預測值 vs 實際值折線圖
-                st.markdown("#### 預測值 vs 實際值（測試集取樣 300 筆）")
-                result_df = pd.DataFrame({'實際值': y_test.values, '預測值': y_pred}).head(300)
-                st.line_chart(result_df)
+                y_actual = test_df['pm25'].values
+
+                # 指標比較表
+                st.markdown("#### 模型指標比較")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**RandomForest**")
+                    st.metric("MAE",  f"{mean_absolute_error(y_actual, rf_pred):.2f} µg/m³")
+                    st.metric("RMSE", f"{mean_squared_error(y_actual, rf_pred)**0.5:.2f} µg/m³")
+                    st.metric("R²",   f"{r2_score(y_actual, rf_pred):.3f}")
+                with col2:
+                    st.markdown("**XGBoost**")
+                    st.metric("MAE",  f"{mean_absolute_error(y_actual, xgb_pred):.2f} µg/m³")
+                    st.metric("RMSE", f"{mean_squared_error(y_actual, xgb_pred)**0.5:.2f} µg/m³")
+                    st.metric("R²",   f"{r2_score(y_actual, xgb_pred):.3f}")
+
+                # 圖1：三條折線比較（取樣 300 筆）
+                st.markdown("#### 預測值 vs 實際值（取樣 300 筆）")
+                n = min(300, len(test_df))
+                chart_df = pd.DataFrame({
+                    '實際值':           y_actual[:n],
+                    'RandomForest 預測': rf_pred[:n],
+                    'XGBoost 預測':      xgb_pred[:n],
+                })
+                st.line_chart(chart_df)
 
                 # 圖2：各縣市預測誤差（MAE）比較
-                st.markdown("#### 各縣市預測誤差（MAE）")
-                eval_df_test = eval_df.loc[X_test.index].copy().reset_index(drop=True)
-                eval_df_test['predicted'] = y_pred
-                eval_df_test['county_zh'] = eval_df_test['county'].replace(COUNTY_MAPPING)
-                eval_df_test['error'] = (eval_df_test['pm25'] - eval_df_test['predicted']).abs()
-                county_err = eval_df_test.groupby('county_zh')['error'].mean().reset_index()
-                county_err.columns = ['縣市', 'MAE']
-                county_err = county_err.sort_values('MAE', ascending=False)
+                st.markdown("#### 各縣市預測誤差（MAE）比較")
+                test_df['rf_error']  = np.abs(y_actual - rf_pred)
+                test_df['xgb_error'] = np.abs(y_actual - xgb_pred)
+                test_df['county_zh'] = test_df['county'].replace(COUNTY_MAPPING)
+                county_err = test_df.groupby('county_zh')[['rf_error', 'xgb_error']].mean().reset_index()
+                county_err.columns = ['縣市', 'RandomForest MAE', 'XGBoost MAE']
+                county_err = county_err.sort_values('RandomForest MAE', ascending=False)
                 st.bar_chart(county_err.set_index('縣市'))
 
             except Exception as e:
