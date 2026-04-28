@@ -9,9 +9,7 @@ from datetime import date, datetime
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import warnings
-import urllib3
 import pytz
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import os
 
 try:
@@ -32,10 +30,10 @@ st.title("全台 PM2.5 監測 x 預測 x 天氣因子整合系統")
 # 金鑰設定（從 .env 或環境變數讀取）
 # ==========================================
 CSV_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pm2.5Data Set')
-MOENV_API_KEY      = st.secrets.get('MOENV_API_KEY', '') or os.environ.get('MOENV_API_KEY', '')
-CWA_API_KEY        = st.secrets.get('CWA_API_KEY', '') or os.environ.get('CWA_API_KEY', '')
-TELEGRAM_BOT_TOKEN = st.secrets.get('TELEGRAM_BOT_TOKEN', '') or os.environ.get('TELEGRAM_BOT_TOKEN', '')
-TELEGRAM_CHAT_ID   = st.secrets.get('TELEGRAM_CHAT_ID', '') or os.environ.get('TELEGRAM_CHAT_ID', '')
+MOENV_API_KEY      = os.environ.get('MOENV_API_KEY', '')
+CWA_API_KEY        = os.environ.get('CWA_API_KEY', '')
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '')
 
 COUNTY_COORDS = {
     '基隆市': [25.1276, 121.7391], '台北市': [25.0329, 121.5654], '新北市': [25.0115, 121.4615],
@@ -83,7 +81,7 @@ def get_cwa_weather():
             f"https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0003-001"
             f"?Authorization={CWA_API_KEY}&elementName=WDSD,HUMD"
         )
-        resp = requests.get(url, timeout=10, verify=False).json()
+        resp = requests.get(url, timeout=10).json()
         stations = resp.get('records', {}).get('Station', [])
 
         county_data = {}
@@ -249,7 +247,7 @@ def get_final_data(selected_date, selected_hour):
             return None
         try:
             url = f"https://data.moenv.gov.tw/api/v2/aqx_p_432?api_key={MOENV_API_KEY}"
-            resp = requests.get(url, timeout=10, verify=False).json()
+            resp = requests.get(url, timeout=10).json()
             records = resp['records'] if isinstance(resp, dict) and 'records' in resp else resp
             df = pd.DataFrame(records)
             pm_col = 'pm2.5' if 'pm2.5' in df.columns else 'pm25'
@@ -306,7 +304,7 @@ def get_final_data(selected_date, selected_hour):
                     f"&limit=1000"
                 )
                 try:
-                    resp = requests.get(url, timeout=20, verify=False)
+                    resp = requests.get(url, timeout=20)
                 except requests.exceptions.Timeout:
                     st.error("API 請求逾時，請稍後再試。")
                     return None
