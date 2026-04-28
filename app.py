@@ -618,11 +618,19 @@ if data is not None:
 
                 # XGBoost（完整特徵）
                 xgb_avail = [f for f in xgb_features if f in test_df.columns and test_df[f].notna().any()]
+                try:
+                    import subprocess
+                    use_gpu = subprocess.run(['nvidia-smi'], capture_output=True).returncode == 0
+                except Exception:
+                    use_gpu = False
+
                 xgb_model = xgb.XGBRegressor(
                     n_estimators=500, learning_rate=0.05, max_depth=6,
                     min_child_weight=3, gamma=0.1,
                     subsample=0.8, colsample_bytree=0.8,
-                    tree_method='hist', enable_categorical=True,
+                    tree_method='hist',
+                    device='cuda' if use_gpu else 'cpu',
+                    enable_categorical=True,
                     random_state=42, verbosity=0
                 )
                 xgb_model.fit(train_df[xgb_avail], train_df['pm25'])
