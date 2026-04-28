@@ -9,7 +9,9 @@ from datetime import date, datetime
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import warnings
+import urllib3
 import pytz
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import os
 
 try:
@@ -30,10 +32,10 @@ st.title("全台 PM2.5 監測 x 預測 x 天氣因子整合系統")
 # 金鑰設定（從 .env 或環境變數讀取）
 # ==========================================
 CSV_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pm2.5Data Set')
-MOENV_API_KEY      = os.environ.get('MOENV_API_KEY', '')
-CWA_API_KEY        = os.environ.get('CWA_API_KEY', '')
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '')
+MOENV_API_KEY      = st.secrets.get('MOENV_API_KEY', '') or os.environ.get('MOENV_API_KEY', '')
+CWA_API_KEY        = st.secrets.get('CWA_API_KEY', '') or os.environ.get('CWA_API_KEY', '')
+TELEGRAM_BOT_TOKEN = st.secrets.get('TELEGRAM_BOT_TOKEN', '') or os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID   = st.secrets.get('TELEGRAM_CHAT_ID', '') or os.environ.get('TELEGRAM_CHAT_ID', '')
 
 COUNTY_COORDS = {
     '基隆市': [25.1276, 121.7391], '台北市': [25.0329, 121.5654], '新北市': [25.0115, 121.4615],
@@ -81,7 +83,7 @@ def get_cwa_weather():
             f"https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0003-001"
             f"?Authorization={CWA_API_KEY}&elementName=WDSD,HUMD"
         )
-        resp = requests.get(url, timeout=10).json()
+        resp = requests.get(url, timeout=10, verify=False).json()
         stations = resp.get('records', {}).get('Station', [])
 
         county_data = {}
@@ -204,6 +206,95 @@ def train_ai_model():
 ai_model, county_averages, model_mae, model_rmse, train_size, val_size, train_start, train_end, val_start, val_end = train_ai_model()
 
 # ==========================================
+# 效能評估模型（快取，只訓練一次）
+# ==========================================
+@st.cache_resource
+def train_eval_models():
+    import xgboost as xgb
+    import subprocess
+    try:
+        WD_MAP = {
+            '北': 0, '北北東': 22.5, '東北': 45, '東北東': 67.5, '東': 90,
+            '東南東': 112.5, '東南': 135, '南南東': 157.5, '南': 180,
+            '南南西': 202.5, '西南': 225, '西南西': 247.5, '西': 270,
+            '西北西': 292.5, '西北': 315, '北北西': 337.5, '靜風': 0
+        }
+        def parse_wind_deg(w):
+            if pd.isna(w): return 0.0
+            w_str = str(w).split(',')[0].strip()
+            return float(WD_MAP.get(w_str, 0.0))
+
+        eval_df = load_csv().copy()
+        eval_df = eval_df.sort_values('time').reset_index(drop=True)
+        eval_df['time_key'] = eval_df['time'].dt.floor('h')
+        eval_df['site_cn']  = eval_df['site'].fillna('')
+
+        weather_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'weather_history.csv')
+        w_df = pd.read_csv(weather_path, encoding='utf-8-sig')
+        w_df['time_key'] = pd.to_datetime(w_df['datacreationdate'], utc=True).dt.tz_convert('Asia/Taipei').dt.tz_localize(None).dt.floor('h')
+        w_df = w_df.drop_duplicates(['site_weather', 'time_key'])
+        w_df['wd_deg']  = w_df['wind_dir'].apply(parse_wind_deg)
+        w_df['wind_u']  = -w_df['wind_speed'] * np.sin(np.radians(w_df['wd_deg']))
+        w_df['wind_v']  = -w_df['wind_speed'] * np.cos(np.radians(w_df['wd_deg']))
+
+        eval_df = pd.merge(
+            eval_df, w_df[['site_weather', 'time_key', 'temp', 'wind_speed', 'humidity', 'wind_u', 'wind_v']],
+            left_on=['site_cn', 'time_key'], right_on=['site_weather', 'time_key'], how='left'
+        )
+
+        eval_df['hour']       = eval_df['time'].dt.hour
+        eval_df['dayofweek']  = eval_df['time'].dt.dayofweek
+        eval_df['month']      = eval_df['time'].dt.month
+        eval_df['hour_sin']   = np.sin(2 * np.pi * eval_df['hour'] / 24)
+        eval_df['hour_cos']   = np.cos(2 * np.pi * eval_df['hour'] / 24)
+        eval_df['is_weekend'] = (eval_df['dayofweek'] >= 5).astype(int)
+
+        for lag in [1, 24, 48]:
+            eval_df[f'pm25_lag_{lag}'] = eval_df.groupby('site_cn')['pm25'].shift(lag)
+
+        eval_df['pm25_roll_24h']  = eval_df.groupby('site_cn')['pm25'].transform(lambda x: x.rolling(24, min_periods=1).mean())
+        eval_df['pm25_roll_168h'] = eval_df.groupby('site_cn')['pm25'].transform(lambda x: x.rolling(168, min_periods=1).mean())
+        eval_df['national_avg']   = eval_df.groupby('time_key')['pm25'].transform('mean')
+        eval_df['site_category']  = eval_df['site_cn'].astype('category')
+        eval_df['wind_u_roll6h']  = eval_df.groupby('site_cn')['wind_u'].transform(lambda x: x.rolling(6, min_periods=1).mean())
+        eval_df['wind_v_roll6h']  = eval_df.groupby('site_cn')['wind_v'].transform(lambda x: x.rolling(6, min_periods=1).mean())
+
+        for col in ['temp', 'wind_speed', 'humidity', 'wind_u', 'wind_v', 'wind_u_roll6h', 'wind_v_roll6h']:
+            eval_df[col] = eval_df[col].fillna(eval_df[col].median())
+
+        rf_features  = ['hour', 'dayofweek', 'month', 'wind_speed', 'humidity']
+        xgb_features = [
+            'site_category', 'hour_sin', 'hour_cos', 'dayofweek', 'is_weekend', 'month',
+            'temp', 'humidity', 'wind_speed', 'wind_u_roll6h', 'wind_v_roll6h',
+            'pm25_lag_1', 'pm25_lag_24', 'pm25_lag_48',
+            'pm25_roll_24h', 'pm25_roll_168h', 'national_avg'
+        ]
+
+        eval_df = eval_df.dropna(subset=rf_features + ['pm25']).reset_index(drop=True)
+        split    = int(len(eval_df) * 0.8)
+        train_df = eval_df.iloc[:split]
+        test_df  = eval_df.iloc[split:].reset_index(drop=True)
+
+        rf_model = RandomForestRegressor(n_estimators=100, max_depth=12, random_state=42, n_jobs=-1)
+        rf_model.fit(train_df[rf_features], train_df['pm25'])
+        rf_pred = rf_model.predict(test_df[rf_features])
+
+        xgb_avail = [f for f in xgb_features if f in test_df.columns and test_df[f].notna().any()]
+        use_gpu = subprocess.run(['nvidia-smi'], capture_output=True).returncode == 0
+        xgb_model = xgb.XGBRegressor(
+            n_estimators=500, learning_rate=0.05, max_depth=6,
+            min_child_weight=3, gamma=0.1, subsample=0.8, colsample_bytree=0.8,
+            tree_method='hist', device='cuda' if use_gpu else 'cpu',
+            enable_categorical=True, random_state=42, verbosity=0
+        )
+        xgb_model.fit(train_df[xgb_avail], train_df['pm25'])
+        xgb_pred = xgb_model.predict(test_df[xgb_avail])
+
+        return rf_pred, xgb_pred, test_df['pm25'].values, test_df
+    except Exception:
+        return None
+
+# ==========================================
 # 核心邏輯：資料分流器
 # ==========================================
 def get_final_data(selected_date, selected_hour):
@@ -247,7 +338,7 @@ def get_final_data(selected_date, selected_hour):
             return None
         try:
             url = f"https://data.moenv.gov.tw/api/v2/aqx_p_432?api_key={MOENV_API_KEY}"
-            resp = requests.get(url, timeout=10).json()
+            resp = requests.get(url, timeout=10, verify=False).json()
             records = resp['records'] if isinstance(resp, dict) and 'records' in resp else resp
             df = pd.DataFrame(records)
             pm_col = 'pm2.5' if 'pm2.5' in df.columns else 'pm25'
@@ -304,7 +395,7 @@ def get_final_data(selected_date, selected_hour):
                     f"&limit=1000"
                 )
                 try:
-                    resp = requests.get(url, timeout=20)
+                    resp = requests.get(url, timeout=20, verify=False)
                 except requests.exceptions.Timeout:
                     st.error("API 請求逾時，請稍後再試。")
                     return None
@@ -531,143 +622,46 @@ if data is not None:
     if ai_model is not None and target_date != today:
         with st.expander("📊 AI 模型效能評估"):
             try:
-                import xgboost as xgb
                 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+                eval_result = train_eval_models()
+                if eval_result is None:
+                    st.warning("效能評估模型訓練失敗，請確認資料是否充足。")
+                else:
+                    rf_pred, xgb_pred, y_actual, test_df = eval_result
 
-                WD_MAP = {
-                    '北': 0, '北北東': 22.5, '東北': 45, '東北東': 67.5, '東': 90,
-                    '東南東': 112.5, '東南': 135, '南南東': 157.5, '南': 180,
-                    '南南西': 202.5, '西南': 225, '西南西': 247.5, '西': 270,
-                    '西北西': 292.5, '西北': 315, '北北西': 337.5, '靜風': 0
-                }
-                def parse_wind_deg(w):
-                    if pd.isna(w): return 0.0
-                    w_str = str(w).split(',')[0].strip()
-                    return float(WD_MAP.get(w_str, 0.0))
+                    # 指標比較表
+                    st.markdown("#### 模型指標比較")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown("**RandomForest**")
+                        st.metric("MAE",  f"{mean_absolute_error(y_actual, rf_pred):.2f} µg/m³")
+                        st.metric("RMSE", f"{mean_squared_error(y_actual, rf_pred)**0.5:.2f} µg/m³")
+                        st.metric("R²",   f"{r2_score(y_actual, rf_pred):.3f}")
+                    with col2:
+                        st.markdown("**XGBoost（完整特徵）**")
+                        st.metric("MAE",  f"{mean_absolute_error(y_actual, xgb_pred):.2f} µg/m³")
+                        st.metric("RMSE", f"{mean_squared_error(y_actual, xgb_pred)**0.5:.2f} µg/m³")
+                        st.metric("R²",   f"{r2_score(y_actual, xgb_pred):.3f}")
 
-                # 讀取空品資料
-                eval_df = load_csv().copy()
-                eval_df = eval_df.sort_values('time').reset_index(drop=True)
-                eval_df['time_key'] = eval_df['time'].dt.floor('h')
-                eval_df['site_cn']  = eval_df['site'].map(lambda s: s if pd.notna(s) else '')
+                    # 圖1：三條折線比較
+                    st.markdown("#### 預測值 vs 實際值（取樣 300 筆）")
+                    n = min(300, len(test_df))
+                    st.line_chart(pd.DataFrame({
+                        '實際值':            y_actual[:n],
+                        'RandomForest 預測': rf_pred[:n],
+                        'XGBoost 預測':      xgb_pred[:n],
+                    }))
 
-                # 讀取天氣歷史資料
-                weather_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'weather_history.csv')
-                w_df = pd.read_csv(weather_path, encoding='utf-8-sig')
-                w_df['time_key'] = pd.to_datetime(w_df['datacreationdate'], utc=True).dt.tz_convert('Asia/Taipei').dt.tz_localize(None).dt.floor('h')
-                w_df = w_df.drop_duplicates(['site_weather', 'time_key'])
-                w_df['wd_deg']  = w_df['wind_dir'].apply(parse_wind_deg)
-                w_df['wind_u']  = -w_df['wind_speed'] * np.sin(np.radians(w_df['wd_deg']))
-                w_df['wind_v']  = -w_df['wind_speed'] * np.cos(np.radians(w_df['wd_deg']))
-
-                # 合併天氣
-                eval_df = pd.merge(
-                    eval_df, w_df[['site_weather', 'time_key', 'temp', 'wind_speed', 'humidity', 'wind_u', 'wind_v']],
-                    left_on=['site_cn', 'time_key'], right_on=['site_weather', 'time_key'], how='left'
-                )
-
-                # 特徵工程
-                eval_df['hour']       = eval_df['time'].dt.hour
-                eval_df['dayofweek']  = eval_df['time'].dt.dayofweek
-                eval_df['month']      = eval_df['time'].dt.month
-                eval_df['hour_sin']   = np.sin(2 * np.pi * eval_df['hour'] / 24)
-                eval_df['hour_cos']   = np.cos(2 * np.pi * eval_df['hour'] / 24)
-                eval_df['is_weekend'] = (eval_df['dayofweek'] >= 5).astype(int)
-
-                # 滯後特徵
-                for lag in [1, 24, 48]:
-                    eval_df[f'pm25_lag_{lag}'] = eval_df.groupby('site_cn')['pm25'].shift(lag)
-
-                # 滾動平均
-                eval_df['pm25_roll_24h']  = eval_df.groupby('site_cn')['pm25'].transform(lambda x: x.rolling(24, min_periods=1).mean())
-                eval_df['pm25_roll_168h'] = eval_df.groupby('site_cn')['pm25'].transform(lambda x: x.rolling(168, min_periods=1).mean())
-
-                # 全台平均 & 測站類別
-                eval_df['national_avg']   = eval_df.groupby('time_key')['pm25'].transform('mean')
-                eval_df['site_category']  = eval_df['site_cn'].astype('category')
-
-                # 滾動風向
-                eval_df['wind_u_roll6h'] = eval_df.groupby('site_cn')['wind_u'].transform(lambda x: x.rolling(6, min_periods=1).mean())
-                eval_df['wind_v_roll6h'] = eval_df.groupby('site_cn')['wind_v'].transform(lambda x: x.rolling(6, min_periods=1).mean())
-
-                # 補缺值
-                for col in ['temp', 'wind_speed', 'humidity', 'wind_u', 'wind_v', 'wind_u_roll6h', 'wind_v_roll6h']:
-                    eval_df[col] = eval_df[col].fillna(eval_df[col].median())
-
-                rf_features = ['hour', 'dayofweek', 'month', 'wind_speed', 'humidity']
-                xgb_features = [
-                    'site_category', 'hour_sin', 'hour_cos', 'dayofweek', 'is_weekend', 'month',
-                    'temp', 'humidity', 'wind_speed', 'wind_u_roll6h', 'wind_v_roll6h',
-                    'pm25_lag_1', 'pm25_lag_24', 'pm25_lag_48',
-                    'pm25_roll_24h', 'pm25_roll_168h', 'national_avg'
-                ]
-
-                eval_df = eval_df.dropna(subset=rf_features + ['pm25']).reset_index(drop=True)
-
-                # 按時間 80/20 切分
-                split = int(len(eval_df) * 0.8)
-                train_df = eval_df.iloc[:split]
-                test_df  = eval_df.iloc[split:].reset_index(drop=True)
-
-                # RandomForest
-                rf_model = RandomForestRegressor(n_estimators=100, max_depth=12, random_state=42, n_jobs=-1)
-                rf_model.fit(train_df[rf_features], train_df['pm25'])
-                rf_pred = rf_model.predict(test_df[rf_features])
-
-                # XGBoost（完整特徵）
-                xgb_avail = [f for f in xgb_features if f in test_df.columns and test_df[f].notna().any()]
-                try:
-                    import subprocess
-                    use_gpu = subprocess.run(['nvidia-smi'], capture_output=True).returncode == 0
-                except Exception:
-                    use_gpu = False
-
-                xgb_model = xgb.XGBRegressor(
-                    n_estimators=500, learning_rate=0.05, max_depth=6,
-                    min_child_weight=3, gamma=0.1,
-                    subsample=0.8, colsample_bytree=0.8,
-                    tree_method='hist',
-                    device='cuda' if use_gpu else 'cpu',
-                    enable_categorical=True,
-                    random_state=42, verbosity=0
-                )
-                xgb_model.fit(train_df[xgb_avail], train_df['pm25'])
-                xgb_pred = xgb_model.predict(test_df[xgb_avail])
-
-                y_actual = test_df['pm25'].values
-
-                # 指標比較表
-                st.markdown("#### 模型指標比較")
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown("**RandomForest**")
-                    st.metric("MAE",  f"{mean_absolute_error(y_actual, rf_pred):.2f} µg/m³")
-                    st.metric("RMSE", f"{mean_squared_error(y_actual, rf_pred)**0.5:.2f} µg/m³")
-                    st.metric("R²",   f"{r2_score(y_actual, rf_pred):.3f}")
-                with col2:
-                    st.markdown("**XGBoost（完整特徵）**")
-                    st.metric("MAE",  f"{mean_absolute_error(y_actual, xgb_pred):.2f} µg/m³")
-                    st.metric("RMSE", f"{mean_squared_error(y_actual, xgb_pred)**0.5:.2f} µg/m³")
-                    st.metric("R²",   f"{r2_score(y_actual, xgb_pred):.3f}")
-
-                # 圖1：三條折線比較
-                st.markdown("#### 預測值 vs 實際值（取樣 300 筆）")
-                n = min(300, len(test_df))
-                st.line_chart(pd.DataFrame({
-                    '實際值':            y_actual[:n],
-                    'RandomForest 預測': rf_pred[:n],
-                    'XGBoost 預測':      xgb_pred[:n],
-                }))
-
-                # 圖2：各縣市預測誤差（MAE）比較
-                st.markdown("#### 各縣市預測誤差（MAE）比較")
-                test_df['rf_error']  = np.abs(y_actual - rf_pred)
-                test_df['xgb_error'] = np.abs(y_actual - xgb_pred)
-                test_df['county_zh'] = test_df['county'].replace(COUNTY_MAPPING)
-                county_err = test_df.groupby('county_zh')[['rf_error', 'xgb_error']].mean().reset_index()
-                county_err.columns = ['縣市', 'RandomForest MAE', 'XGBoost MAE']
-                county_err = county_err.sort_values('RandomForest MAE', ascending=False)
-                st.bar_chart(county_err.set_index('縣市'))
+                    # 圖2：各縣市預測誤差（MAE）比較
+                    st.markdown("#### 各縣市預測誤差（MAE）比較")
+                    test_df = test_df.copy()
+                    test_df['rf_error']  = np.abs(y_actual - rf_pred)
+                    test_df['xgb_error'] = np.abs(y_actual - xgb_pred)
+                    test_df['county_zh'] = test_df['county'].replace(COUNTY_MAPPING)
+                    county_err = test_df.groupby('county_zh')[['rf_error', 'xgb_error']].mean().reset_index()
+                    county_err.columns = ['縣市', 'RandomForest MAE', 'XGBoost MAE']
+                    county_err = county_err.sort_values('RandomForest MAE', ascending=False)
+                    st.bar_chart(county_err.set_index('縣市'))
 
             except Exception as e:
                 st.warning(f"效能評估無法載入：{e}")
