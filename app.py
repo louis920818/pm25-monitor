@@ -530,7 +530,7 @@ if data is not None:
         st.dataframe(data, use_container_width=True)
 
     # --- AI 模型效能評估 ---
-    if ai_model is not None:
+    if ai_model is not None and target_date != today:
         with st.expander("📊 AI 模型效能評估"):
             try:
                 from sklearn.model_selection import train_test_split
